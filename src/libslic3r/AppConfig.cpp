@@ -403,7 +403,7 @@ void AppConfig::set_defaults()
     }
 
     if (get("backup_switch").empty() || get("version") < "01.06.00.00") {
-        set_bool("backup_switch", true);
+        set_bool("backup_switch", false);
     }
 
     if (get("backup_interval").empty()) {
