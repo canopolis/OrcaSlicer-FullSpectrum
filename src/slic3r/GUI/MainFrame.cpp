@@ -12,6 +12,7 @@
 #include <wx/tooltip.h>
 //#include <wx/glcanvas.h>
 #include <wx/filename.h>
+#include <wx/choicdlg.h>
 #include <wx/debug.h>
 #include <wx/utils.h>
 
@@ -19,6 +20,9 @@
 #include <boost/log/trivial.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/nowide/cstdlib.hpp>
+#include <algorithm>
+#include <cstdio>
 
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Polygon.hpp"
@@ -2388,6 +2392,9 @@ static wxMenu* generate_help_menu()
     // Export Logs
     append_menu_item(helpMenu, wxID_ANY, _L("Export Logs"), _L("Export application logs as ZIP file"),
         [](wxCommandEvent&) { wxGetApp().mainframe->export_logs(); });
+    // Delete selected log files
+    append_menu_item(helpMenu, wxID_ANY, _L("Delete Logs..."), _L("Select log files and delete them"),
+        [](wxCommandEvent&) { wxGetApp().mainframe->delete_logs(); });
 
     append_menu_item(helpMenu, wxID_ANY, _L("Show Tip of the Day"), _L("Show Tip of the Day"), [](wxCommandEvent&) {
         wxGetApp().plater()->get_dailytips()->open();
@@ -4171,6 +4178,75 @@ void MainFrame::show_sync_dialog()
 {
     SimpleEvent* evt = new SimpleEvent(EVT_SYNC_CLOUD_PRESET);
     wxQueueEvent(this, evt);
+}
+
+// Same folder where set_log_path_and_level() writes the logs.
+static boost::filesystem::path runtime_log_folder()
+{
+    boost::filesystem::path folder = boost::filesystem::path(data_dir()) / "log";
+#ifdef _WIN32
+    if (const char *local_appdata = boost::nowide::getenv("LOCALAPPDATA"); local_appdata != nullptr && *local_appdata != '\0')
+        folder = boost::filesystem::path(local_appdata) / "Snapmaker_Orca" / "log";
+#endif
+    return folder;
+}
+
+void MainFrame::delete_logs()
+{
+    namespace fs = boost::filesystem;
+    const fs::path folder = runtime_log_folder();
+
+    struct LogEntry { fs::path path; std::time_t time; uintmax_t size; };
+    std::vector<LogEntry> entries;
+    boost::system::error_code ec;
+    if (fs::exists(folder, ec)) {
+        for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            if (!fs::is_regular_file(it->path(), ec))
+                continue;
+            LogEntry e{it->path(), fs::last_write_time(it->path(), ec), fs::file_size(it->path(), ec)};
+            entries.push_back(e);
+        }
+    }
+    if (entries.empty()) {
+        MessageDialog dlg(this, _L("No logs found."), _L("Delete Logs"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+    std::sort(entries.begin(), entries.end(), [](const LogEntry &a, const LogEntry &b) { return a.time > b.time; });
+
+    wxArrayString choices;
+    for (const LogEntry &e : entries) {
+        char size_buf[32];
+        std::snprintf(size_buf, sizeof(size_buf), "%.1f MB", double(e.size) / (1024.0 * 1024.0));
+        choices.Add(from_u8(e.path.filename().string()) + "   (" + wxString::FromUTF8(size_buf) + ")");
+    }
+
+    wxMultiChoiceDialog choose(this, _L("Select the log files to delete.\nThe log of the current session is in use and will be skipped."),
+                               _L("Delete Logs"), choices);
+    if (choose.ShowModal() != wxID_OK)
+        return;
+    const wxArrayInt selected = choose.GetSelections();
+    if (selected.IsEmpty())
+        return;
+
+    MessageDialog confirm(this, wxString::Format(_L("Delete %d log file(s)?"), int(selected.GetCount())), _L("Delete Logs"),
+                          wxYES_NO | wxICON_QUESTION);
+    if (confirm.ShowModal() != wxID_YES)
+        return;
+
+    int deleted = 0, skipped = 0;
+    for (int idx : selected) {
+        boost::system::error_code rm_ec;
+        if (fs::remove(entries[size_t(idx)].path, rm_ec) && !rm_ec)
+            ++deleted;
+        else
+            ++skipped;
+    }
+    wxString msg = wxString::Format(_L("Deleted: %d"), deleted);
+    if (skipped > 0)
+        msg += "\n" + wxString::Format(_L("Not deleted (in use or locked): %d"), skipped);
+    MessageDialog done(this, msg, _L("Delete Logs"), wxOK | wxICON_INFORMATION);
+    done.ShowModal();
 }
 
 void MainFrame::export_logs()

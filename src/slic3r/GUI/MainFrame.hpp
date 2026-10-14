@@ -285,6 +285,7 @@ public:
     //BBS
     void        show_log_window();
     void        export_logs();
+    void        delete_logs();
 
     void        update_ui_from_settings();
     //BBS

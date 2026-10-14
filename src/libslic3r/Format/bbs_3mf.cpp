@@ -1,3 +1,4 @@
+#include <chrono>
 #include "../libslic3r.h"
 #include "../Exception.hpp"
 #include "../Model.hpp"
@@ -6422,6 +6423,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
 
         FullSpectrum3mf::PackageWritePlan plan;
+        const auto fs_t0 = std::chrono::steady_clock::now();
         try {
             plan = FullSpectrum3mf::build_write_plan(config, geometry, true);
         } catch (const std::exception &e) {
@@ -6430,9 +6432,20 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             return true;
         }
 
+        const auto fs_t1 = std::chrono::steady_clock::now();
+        BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: build_write_plan "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(fs_t1 - fs_t0).count() << " ms, parts "
+                                << plan.parts.size();
         for (const FullSpectrum3mf::PackagePartPlan &part : plan.parts) {
             const std::string zip_path = FullSpectrum3mf::package_path_to_zip_path(part.path);
-            if (!mz_zip_writer_add_mem(&archive, zip_path.c_str(), part.bytes.data(), part.bytes.size(), MZ_DEFAULT_COMPRESSION)) {
+            const auto        part_t0  = std::chrono::steady_clock::now();
+            // Fastest deflate level: lossless like the default, much faster on
+            // the very large per-triangle image-map JSON.
+            const bool added = mz_zip_writer_add_mem(&archive, zip_path.c_str(), part.bytes.data(), part.bytes.size(), MZ_BEST_SPEED);
+            BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: add " << zip_path << " (" << part.bytes.size() << " bytes) "
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - part_t0).count()
+                                    << " ms";
+            if (!added) {
                 m_fullspectrum_relationships_xml.clear();
                 BOOST_LOG_TRIVIAL(error) << "Unable to add FullSpectrum part " << part.path
                                          << " to archive; continuing with legacy 3MF save";

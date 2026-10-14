@@ -320,6 +320,8 @@ struct PackageModel
     std::vector<PreservedPart>    preserved_parts;
     // Serialized image_maps JSON, computed once and reused (large meshes).
     std::string                   image_maps_json;
+    // SHA-256 of image_maps_json, cached with it.
+    std::string                   image_maps_sha256;
 };
 
 struct PackagePartPlan
@@ -330,6 +332,8 @@ struct PackagePartPlan
     std::string bytes;
     bool        required = false;
     bool        must_preserve = false;
+    // Optional precomputed SHA-256 of bytes (empty = compute when needed).
+    std::string sha256;
 };
 
 struct PackageRelationshipPlan

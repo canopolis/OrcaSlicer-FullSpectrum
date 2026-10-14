@@ -250,8 +250,12 @@ void AppConfig::set_defaults()
     if (get("enable_ssl_for_ftp").empty())
         set_bool("enable_ssl_for_ftp", true);
 
-    if (get("log_severity_level").empty())
-        set("log_severity_level", "warning");
+    // Always log at least at "info" level (keeps "debug"/"trace" if chosen).
+    {
+        const std::string lvl = get("log_severity_level");
+        if (lvl != "info" && lvl != "debug" && lvl != "trace")
+            set("log_severity_level", "info");
+    }
 
     if (get("internal_developer_mode").empty())
         set_bool("internal_developer_mode", false);

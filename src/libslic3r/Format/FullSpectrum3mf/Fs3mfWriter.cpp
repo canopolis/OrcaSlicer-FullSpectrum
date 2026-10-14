@@ -277,7 +277,7 @@ ManifestPart make_manifest_part(const PackagePartPlan &part)
     manifest_part.path = part.path;
     manifest_part.content_type = part.content_type;
     manifest_part.required = part.required;
-    manifest_part.checksum.value = sha256_hex(part.bytes);
+    manifest_part.checksum.value = part.sha256.empty() ? sha256_hex(part.bytes) : part.sha256;
     return manifest_part;
 }
 
@@ -365,6 +365,7 @@ struct ImageMapsCache
     std::optional<ImageMaps>                             image_maps;
     std::vector<ImageMapAssetPart>                       assets;
     std::string                                          json;
+    std::string                                          json_sha256;
 };
 
 std::mutex     s_image_maps_cache_mutex;
@@ -398,8 +399,10 @@ void build_image_maps_cached(const GeometryBindingInput &geometry, const std::st
     if (!hit) {
         ImageMapsCache fresh;
         fresh.image_maps = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, fresh.assets);
-        if (fresh.image_maps)
-            fresh.json = serialize_image_maps_fast(*fresh.image_maps);
+        if (fresh.image_maps) {
+            fresh.json        = serialize_image_maps_fast(*fresh.image_maps);
+            fresh.json_sha256 = sha256_hex(fresh.json);
+        }
         fresh.key = std::move(key);
         for (const auto &source : sources)
             fresh.sources.emplace_back(source);
@@ -408,6 +411,7 @@ void build_image_maps_cached(const GeometryBindingInput &geometry, const std::st
     model.image_maps       = s_image_maps_cache.image_maps;
     model.image_map_assets = s_image_maps_cache.assets;
     model.image_maps_json  = s_image_maps_cache.json;
+    model.image_maps_sha256 = s_image_maps_cache.json_sha256;
 }
 } // namespace
 
@@ -612,8 +616,11 @@ PackageWritePlan build_write_plan(const PackageModel &model)
     if (model.mixed_filaments)
         add_part(plan, PATH_MIXED_FILAMENTS, CONTENT_TYPE_MIXED_FILAMENTS, "mixed-filaments", serialize_json(*model.mixed_filaments), true, &emitted_paths);
     if (model.image_maps) {
+        const size_t parts_before = plan.parts.size();
         add_part(plan, PATH_IMAGE_MAPS, CONTENT_TYPE_IMAGE_MAPS, "image-maps",
                  model.image_maps_json.empty() ? serialize_image_maps_fast(*model.image_maps) : model.image_maps_json, true, &emitted_paths);
+        if (plan.parts.size() > parts_before && !model.image_maps_json.empty())
+            plan.parts.back().sha256 = model.image_maps_sha256;
         for (const ImageMapAssetPart &asset : model.image_map_assets)
             add_part(plan, asset.path, asset.content_type, "image-map-asset", asset.bytes, true, &emitted_paths);
     }
