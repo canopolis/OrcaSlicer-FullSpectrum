@@ -100,6 +100,12 @@ void from_json(const nlohmann::json &j, ImageMaps &v);
 void to_json(nlohmann::json &j, const PreservedPart &v);
 void from_json(const nlohmann::json &j, PreservedPart &v);
 
+// Fast paths for image maps (one binding per triangle; nlohmann DOM is too
+// slow for meshes with >1M triangles). Output is valid JSON with the same
+// keys; parse falls back to nlohmann on anything unexpected.
+std::string serialize_image_maps_fast(const ImageMaps &value);
+ImageMaps   parse_image_maps_fast(const std::string &bytes);
+
 template<class T> std::string serialize_json(const T &value)
 {
     nlohmann::json j = value;

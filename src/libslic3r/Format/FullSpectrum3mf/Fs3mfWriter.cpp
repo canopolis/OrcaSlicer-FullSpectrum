@@ -399,7 +399,7 @@ void build_image_maps_cached(const GeometryBindingInput &geometry, const std::st
         ImageMapsCache fresh;
         fresh.image_maps = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, fresh.assets);
         if (fresh.image_maps)
-            fresh.json = serialize_json(*fresh.image_maps);
+            fresh.json = serialize_image_maps_fast(*fresh.image_maps);
         fresh.key = std::move(key);
         for (const auto &source : sources)
             fresh.sources.emplace_back(source);
@@ -613,7 +613,7 @@ PackageWritePlan build_write_plan(const PackageModel &model)
         add_part(plan, PATH_MIXED_FILAMENTS, CONTENT_TYPE_MIXED_FILAMENTS, "mixed-filaments", serialize_json(*model.mixed_filaments), true, &emitted_paths);
     if (model.image_maps) {
         add_part(plan, PATH_IMAGE_MAPS, CONTENT_TYPE_IMAGE_MAPS, "image-maps",
-                 model.image_maps_json.empty() ? serialize_json(*model.image_maps) : model.image_maps_json, true, &emitted_paths);
+                 model.image_maps_json.empty() ? serialize_image_maps_fast(*model.image_maps) : model.image_maps_json, true, &emitted_paths);
         for (const ImageMapAssetPart &asset : model.image_map_assets)
             add_part(plan, asset.path, asset.content_type, "image-map-asset", asset.bytes, true, &emitted_paths);
     }

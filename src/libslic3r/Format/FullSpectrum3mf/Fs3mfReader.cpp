@@ -247,7 +247,7 @@ bool parse_canonical_parts(const std::map<std::string, std::string> &parts,
     if (find_part(parts, image_maps_path, image_maps_bytes)) {
         if (!read_manifest_part(parts, out.manifest, image_maps_path, image_maps_bytes, warning))
             return false;
-        out.image_maps = parse_json<ImageMaps>(image_maps_bytes);
+        out.image_maps = parse_image_maps_fast(image_maps_bytes);
         if (!require_kind_schema("image maps", out.image_maps->kind, KIND_IMAGE_MAPS, out.image_maps->schema_version, warning))
             return false;
     }

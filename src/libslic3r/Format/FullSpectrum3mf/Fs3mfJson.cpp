@@ -2,6 +2,12 @@
 
 #include "Fs3mfConstants.hpp"
 
+#include <charconv>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+#include <string_view>
+
 namespace Slic3r::FullSpectrum3mf {
 
 namespace {
@@ -618,6 +624,394 @@ void from_json(const nlohmann::json &j, PreservedPart &v)
     get_if_present(j, "bytes", v.bytes);
     get_if_present(j, "required", v.required);
     get_if_present(j, "must_preserve", v.must_preserve);
+}
+
+// ---------------------------------------------------------------------------
+// Fast image-map JSON (writer + reader)
+// ---------------------------------------------------------------------------
+namespace {
+
+struct EscapedStringCache
+{
+    std::string last_in;
+    std::string last_out;
+    bool        valid = false;
+    const std::string &get(const std::string &in)
+    {
+        if (!valid || in != last_in) {
+            last_in  = in;
+            last_out = nlohmann::json(in).dump();
+            valid    = true;
+        }
+        return last_out;
+    }
+};
+
+void append_double(std::string &out, double v)
+{
+    if (!std::isfinite(v)) {
+        out += "null";
+        return;
+    }
+    char  buf[64];
+    char *end = nlohmann::detail::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, end);
+}
+
+void append_double_array(std::string &out, const std::vector<double> &values)
+{
+    out += '[';
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i)
+            out += ',';
+        append_double(out, values[i]);
+    }
+    out += ']';
+}
+
+struct FastReader
+{
+    const char *p;
+    const char *e;
+
+    [[noreturn]] void fail() const { throw std::runtime_error("image-maps fast parse"); }
+    void ws()
+    {
+        while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t'))
+            ++p;
+    }
+    void expect(char c)
+    {
+        ws();
+        if (p >= e || *p != c)
+            fail();
+        ++p;
+    }
+    bool consume(char c)
+    {
+        ws();
+        if (p < e && *p == c) {
+            ++p;
+            return true;
+        }
+        return false;
+    }
+    // Returns the raw string token including quotes.
+    std::string_view raw_string()
+    {
+        ws();
+        if (p >= e || *p != '"')
+            fail();
+        const char *s = p++;
+        while (p < e && *p != '"') {
+            if (*p == '\\')
+                ++p;
+            ++p;
+        }
+        if (p >= e)
+            fail();
+        ++p;
+        return std::string_view(s, size_t(p - s));
+    }
+    std::string string_value()
+    {
+        std::string_view r = raw_string();
+        if (r.find('\\') == std::string_view::npos)
+            return std::string(r.substr(1, r.size() - 2));
+        return nlohmann::json::parse(r.begin(), r.end()).get<std::string>();
+    }
+    // Keys used here never contain escapes; an escaped key just won't match.
+    std::string_view key()
+    {
+        std::string_view r = raw_string();
+        expect(':');
+        return r.substr(1, r.size() - 2);
+    }
+    void skip_value()
+    {
+        ws();
+        if (p >= e)
+            fail();
+        if (*p == '"') {
+            raw_string();
+            return;
+        }
+        if (*p == '{' || *p == '[') {
+            int depth = 0;
+            while (p < e) {
+                char c = *p;
+                if (c == '"') {
+                    raw_string();
+                    continue;
+                }
+                if (c == '{' || c == '[')
+                    ++depth;
+                else if (c == '}' || c == ']') {
+                    if (--depth == 0) {
+                        ++p;
+                        return;
+                    }
+                }
+                ++p;
+            }
+            fail();
+        }
+        while (p < e && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t')
+            ++p;
+    }
+    template<class T> T delegate()
+    {
+        ws();
+        const char *s = p;
+        skip_value();
+        return nlohmann::json::parse(s, p).get<T>();
+    }
+    double number()
+    {
+        ws();
+        double v = 0.;
+#if defined(_MSC_VER)
+        auto r = std::from_chars(p, e, v);
+        if (r.ec != std::errc())
+            fail();
+        p = r.ptr;
+#else
+        const char *s = p;
+        while (p < e && (std::strchr("+-0123456789.eE", *p) != nullptr) && *p != '\0')
+            ++p;
+        if (p == s)
+            fail();
+        v = nlohmann::json::parse(s, p).get<double>();
+#endif
+        return v;
+    }
+    uint64_t unsigned_number()
+    {
+        ws();
+        uint64_t v = 0;
+        auto     r = std::from_chars(p, e, v);
+        if (r.ec != std::errc())
+            fail();
+        p = r.ptr;
+        // tolerate a fractional/exponent part written by other tools
+        if (p < e && (*p == '.' || *p == 'e' || *p == 'E'))
+            fail();
+        return v;
+    }
+    void double_array(std::vector<double> &out)
+    {
+        out.clear();
+        expect('[');
+        if (consume(']'))
+            return;
+        do {
+            out.push_back(number());
+        } while (consume(','));
+        expect(']');
+    }
+};
+
+struct CachedString
+{
+    std::string_view raw;
+    std::string      value;
+};
+
+void read_string_cached(FastReader &r, CachedString &cache, std::string &out)
+{
+    const char      *before = r.p;
+    std::string_view raw    = r.raw_string();
+    (void) before;
+    if (raw != cache.raw) {
+        cache.raw = raw;
+        if (raw.find('\\') == std::string_view::npos)
+            cache.value.assign(raw.data() + 1, raw.size() - 2);
+        else
+            cache.value = nlohmann::json::parse(raw.begin(), raw.end()).get<std::string>();
+    }
+    out = cache.value;
+}
+
+struct SourceStringCaches
+{
+    CachedString kind, texture_asset_ref, wrap_u, wrap_v;
+};
+
+void read_source(FastReader &r, ImageMapSurfaceSource &src, SourceStringCaches &caches)
+{
+    r.expect('{');
+    if (r.consume('}'))
+        return;
+    do {
+        std::string_view k = r.key();
+        if (k == "kind")
+            read_string_cached(r, caches.kind, src.kind);
+        else if (k == "texture_asset_ref")
+            read_string_cached(r, caches.texture_asset_ref, src.texture_asset_ref);
+        else if (k == "wrap_u")
+            read_string_cached(r, caches.wrap_u, src.wrap_u);
+        else if (k == "wrap_v")
+            read_string_cached(r, caches.wrap_v, src.wrap_v);
+        else if (k == "uvs")
+            r.double_array(src.uvs);
+        else if (k == "corner_rgba")
+            r.double_array(src.corner_rgba);
+        else
+            r.skip_value();
+    } while (r.consume(','));
+    r.expect('}');
+}
+
+void read_bindings(FastReader &r, std::vector<ImageMapTriangleBinding> &out)
+{
+    out.clear();
+    SourceStringCaches caches;
+    r.expect('[');
+    if (r.consume(']'))
+        return;
+    do {
+        ImageMapTriangleBinding b;
+        r.expect('{');
+        if (!r.consume('}')) {
+            do {
+                std::string_view k = r.key();
+                if (k == "triangle_index")
+                    b.triangle_index = uint32_t(r.unsigned_number());
+                else if (k == "zone_index")
+                    b.zone_index = uint32_t(r.unsigned_number());
+                else if (k == "source")
+                    read_source(r, b.source, caches);
+                else
+                    r.skip_value();
+            } while (r.consume(','));
+            r.expect('}');
+        }
+        out.emplace_back(std::move(b));
+    } while (r.consume(','));
+    r.expect(']');
+}
+
+void read_volume(FastReader &r, ImageMapVolume &v)
+{
+    r.expect('{');
+    if (r.consume('}'))
+        return;
+    do {
+        std::string_view k = r.key();
+        if (k == "stable_volume_id")
+            v.stable_volume_id = r.string_value();
+        else if (k == "topology_fingerprint")
+            v.topology_fingerprint = r.unsigned_number();
+        else if (k == "zones")
+            v.zones = r.delegate<std::vector<ImageMapZone>>();
+        else if (k == "triangle_bindings")
+            read_bindings(r, v.triangle_bindings);
+        else
+            r.skip_value();
+    } while (r.consume(','));
+    r.expect('}');
+}
+
+ImageMaps parse_image_maps_custom(const std::string &bytes)
+{
+    FastReader r{bytes.data(), bytes.data() + bytes.size()};
+    ImageMaps  out;
+    r.expect('{');
+    if (!r.consume('}')) {
+        do {
+            std::string_view k = r.key();
+            if (k == "kind")
+                out.kind = r.string_value();
+            else if (k == "schema_version")
+                out.schema_version = r.string_value();
+            else if (k == "texture_assets")
+                out.texture_assets = r.delegate<std::vector<ImageMapTextureAsset>>();
+            else if (k == "volumes") {
+                r.expect('[');
+                if (!r.consume(']')) {
+                    do {
+                        ImageMapVolume v;
+                        read_volume(r, v);
+                        out.volumes.emplace_back(std::move(v));
+                    } while (r.consume(','));
+                    r.expect(']');
+                }
+            } else
+                r.skip_value();
+        } while (r.consume(','));
+        r.expect('}');
+    }
+    r.ws();
+    if (r.p != r.e)
+        r.fail();
+    return out;
+}
+
+} // namespace
+
+std::string serialize_image_maps_fast(const ImageMaps &v)
+{
+    size_t bindings = 0;
+    for (const ImageMapVolume &vol : v.volumes)
+        bindings += vol.triangle_bindings.size();
+
+    std::string out;
+    out.reserve(4096 + bindings * 320);
+    out += "{\"kind\":";
+    out += nlohmann::json(v.kind).dump();
+    out += ",\"schema_version\":";
+    out += nlohmann::json(v.schema_version).dump();
+    out += ",\"texture_assets\":";
+    out += nlohmann::json(v.texture_assets).dump();
+    out += ",\"volumes\":[";
+    for (size_t vi = 0; vi < v.volumes.size(); ++vi) {
+        const ImageMapVolume &vol = v.volumes[vi];
+        if (vi)
+            out += ',';
+        out += "{\"stable_volume_id\":";
+        out += nlohmann::json(vol.stable_volume_id).dump();
+        out += ",\"topology_fingerprint\":";
+        out += std::to_string(vol.topology_fingerprint);
+        out += ",\"zones\":";
+        out += nlohmann::json(vol.zones).dump();
+        out += ",\"triangle_bindings\":[";
+        EscapedStringCache kind, asset, wrap_u, wrap_v;
+        for (size_t bi = 0; bi < vol.triangle_bindings.size(); ++bi) {
+            const ImageMapTriangleBinding &b = vol.triangle_bindings[bi];
+            if (bi)
+                out += ',';
+            out += "{\"triangle_index\":";
+            out += std::to_string(b.triangle_index);
+            out += ",\"zone_index\":";
+            out += std::to_string(b.zone_index);
+            out += ",\"source\":{\"kind\":";
+            out += kind.get(b.source.kind);
+            out += ",\"texture_asset_ref\":";
+            out += asset.get(b.source.texture_asset_ref);
+            out += ",\"wrap_u\":";
+            out += wrap_u.get(b.source.wrap_u);
+            out += ",\"wrap_v\":";
+            out += wrap_v.get(b.source.wrap_v);
+            out += ",\"uvs\":";
+            append_double_array(out, b.source.uvs);
+            out += ",\"corner_rgba\":";
+            append_double_array(out, b.source.corner_rgba);
+            out += "}}";
+        }
+        out += "]}";
+    }
+    out += "]}";
+    return out;
+}
+
+ImageMaps parse_image_maps_fast(const std::string &bytes)
+{
+    try {
+        return parse_image_maps_custom(bytes);
+    } catch (...) {
+        // Unexpected layout: use the original (slow but complete) parser.
+        return parse_json<ImageMaps>(bytes);
+    }
 }
 
 } // namespace Slic3r::FullSpectrum3mf
