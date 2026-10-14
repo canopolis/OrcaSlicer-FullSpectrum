@@ -318,6 +318,8 @@ struct PackageModel
     std::optional<ImageMaps>      image_maps;
     std::vector<ImageMapAssetPart> image_map_assets;
     std::vector<PreservedPart>    preserved_parts;
+    // Serialized image_maps JSON, computed once and reused (large meshes).
+    std::string                   image_maps_json;
 };
 
 struct PackagePartPlan

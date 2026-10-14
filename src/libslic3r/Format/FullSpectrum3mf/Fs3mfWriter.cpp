@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <iomanip>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <openssl/sha.h>
 #include <set>
 #include <sstream>
@@ -350,6 +353,64 @@ std::string xml_escape(const std::string &text)
 
 } // namespace
 
+// Image maps hold one binding per triangle. For meshes with >1M triangles,
+// building and serializing them (nlohmann::json) takes minutes, and the
+// periodic project backup runs this on the GUI thread. Cache the result
+// keyed by the immutable VolumeData pointers so unchanged data is reused.
+namespace {
+struct ImageMapsCache
+{
+    std::string                                          key;
+    std::vector<std::weak_ptr<const ImageMap::VolumeData>> sources;
+    std::optional<ImageMaps>                             image_maps;
+    std::vector<ImageMapAssetPart>                       assets;
+    std::string                                          json;
+};
+
+std::mutex     s_image_maps_cache_mutex;
+ImageMapsCache s_image_maps_cache;
+
+void build_image_maps_cached(const GeometryBindingInput &geometry, const std::string &materials_json,
+                             const std::string &mixed_json, PackageModel &model)
+{
+    std::string key = materials_json;
+    key += '\x1f';
+    key += mixed_json;
+    std::vector<std::shared_ptr<const ImageMap::VolumeData>> sources;
+    for (const VolumeBindingInput &volume : geometry.volumes) {
+        if (!volume.image_map_data || volume.image_map_data->empty())
+            continue;
+        key += '\x1f';
+        key += volume.stable_volume_id;
+        key += '@';
+        key += std::to_string(reinterpret_cast<std::uintptr_t>(volume.image_map_data.get()));
+        sources.push_back(volume.image_map_data);
+    }
+    if (sources.empty()) {
+        model.image_maps = std::nullopt;
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(s_image_maps_cache_mutex);
+    bool hit = s_image_maps_cache.key == key && s_image_maps_cache.sources.size() == sources.size();
+    for (size_t i = 0; hit && i < sources.size(); ++i)
+        hit = s_image_maps_cache.sources[i].lock() == sources[i];
+    if (!hit) {
+        ImageMapsCache fresh;
+        fresh.image_maps = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, fresh.assets);
+        if (fresh.image_maps)
+            fresh.json = serialize_json(*fresh.image_maps);
+        fresh.key = std::move(key);
+        for (const auto &source : sources)
+            fresh.sources.emplace_back(source);
+        s_image_maps_cache = std::move(fresh);
+    }
+    model.image_maps       = s_image_maps_cache.image_maps;
+    model.image_map_assets = s_image_maps_cache.assets;
+    model.image_maps_json  = s_image_maps_cache.json;
+}
+} // namespace
+
 std::string stable_object_id_from_model_id(int model_object_id)
 {
     return make_stable_id("obj", std::to_string(model_object_id));
@@ -405,7 +466,9 @@ PackageModel build_package_model(const DynamicPrintConfig &config,
     PackageModel model;
     model.materials = materials_from_project_config(config);
     model.mixed_filaments = mixed_filaments_from_project_config(config, model.materials);
-    model.image_maps = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, model.image_map_assets);
+    const std::string materials_json = serialize_json(model.materials);
+    const std::string mixed_json     = model.mixed_filaments ? serialize_json(*model.mixed_filaments) : std::string();
+    build_image_maps_cached(geometry, materials_json, mixed_json, model);
     model.preserved_parts = geometry.preserved_parts;
 
     model.project.kind = KIND_PROJECT;
@@ -413,9 +476,8 @@ PackageModel build_package_model(const DynamicPrintConfig &config,
     model.project.display_name = geometry.project_name;
     model.project.legacy_projection_written = write_legacy_projection;
 
-    const std::string project_seed = serialize_json(model.materials) +
-                                     (model.mixed_filaments ? serialize_json(*model.mixed_filaments) : std::string()) +
-                                     (model.image_maps ? serialize_json(*model.image_maps) : std::string()) +
+    const std::string project_seed = materials_json + mixed_json +
+                                     (model.image_maps ? model.image_maps_json : std::string()) +
                                      geometry.project_name;
     model.project.project_id = make_stable_id("proj", project_seed);
 
@@ -550,7 +612,8 @@ PackageWritePlan build_write_plan(const PackageModel &model)
     if (model.mixed_filaments)
         add_part(plan, PATH_MIXED_FILAMENTS, CONTENT_TYPE_MIXED_FILAMENTS, "mixed-filaments", serialize_json(*model.mixed_filaments), true, &emitted_paths);
     if (model.image_maps) {
-        add_part(plan, PATH_IMAGE_MAPS, CONTENT_TYPE_IMAGE_MAPS, "image-maps", serialize_json(*model.image_maps), true, &emitted_paths);
+        add_part(plan, PATH_IMAGE_MAPS, CONTENT_TYPE_IMAGE_MAPS, "image-maps",
+                 model.image_maps_json.empty() ? serialize_json(*model.image_maps) : model.image_maps_json, true, &emitted_paths);
         for (const ImageMapAssetPart &asset : model.image_map_assets)
             add_part(plan, asset.path, asset.content_type, "image-map-asset", asset.bytes, true, &emitted_paths);
     }
