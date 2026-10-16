@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <cstdint>
+#include <chrono>
+#include <boost/log/trivial.hpp>
 #include <memory>
 #include <mutex>
 #include <openssl/sha.h>
@@ -480,10 +482,14 @@ PackageModel build_package_model(const DynamicPrintConfig &config,
     model.project.display_name = geometry.project_name;
     model.project.legacy_projection_written = write_legacy_projection;
 
+    const auto        seed_t0      = std::chrono::steady_clock::now();
     const std::string project_seed = materials_json + mixed_json +
                                      (model.image_maps ? model.image_maps_json : std::string()) +
                                      geometry.project_name;
     model.project.project_id = make_stable_id("proj", project_seed);
+    BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: project seed + project id "
+                            << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - seed_t0).count()
+                            << " ms (seed " << project_seed.size() << " bytes)";
 
     model.identity_map.kind = KIND_IDENTITY_MAP;
     model.identity_map.schema_version = PROFILE_VERSION;
@@ -543,7 +549,10 @@ PackageModel build_package_model(const DynamicPrintConfig &config,
     model.manifest.kind = KIND_MANIFEST;
     model.manifest.schema_version = PROFILE_VERSION;
     model.manifest.document_class = "project";
+    const auto pkg_t0 = std::chrono::steady_clock::now();
     model.manifest.package_id = make_stable_id("pkg", project_seed);
+    BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: package id "
+                            << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pkg_t0).count() << " ms";
     model.manifest.required_features = {
         FEATURE_PROJECT_CORE,
         FEATURE_IDENTITY_MAP,

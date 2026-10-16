@@ -41,10 +41,46 @@ std::string short_stable_hash(const std::string &value)
     return ss.str();
 }
 
+namespace {
+// Same result as sanitize_id_fragment() when it fits in max_size characters.
+// Stops early as soon as the result can no longer fit: every alphanumeric or
+// '-' character survives sanitizing, so more than max_size of them means the
+// sanitized form is too long and the hash is used instead. Avoids scanning
+// hundreds of MB (the project seed contains the whole image-maps JSON).
+bool sanitized_fits(const std::string &value, size_t max_size, std::string &result)
+{
+    std::string out;
+    size_t      solid = 0;
+    for (char c : value) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) {
+            out.push_back(static_cast<char>(std::tolower(uc)));
+            ++solid;
+        } else if (c == '-') {
+            out.push_back(c);
+            ++solid;
+        } else if (c == '_')
+            out.push_back(c);
+        else if (!out.empty() && out.back() != '_')
+            out.push_back('_');
+        if (solid > max_size)
+            return false;
+    }
+    while (!out.empty() && out.front() == '_')
+        out.erase(out.begin());
+    while (!out.empty() && out.back() == '_')
+        out.pop_back();
+    if (out.empty() || out.size() > max_size)
+        return false;
+    result = std::move(out);
+    return true;
+}
+} // namespace
+
 std::string make_stable_id(const std::string &prefix, const std::string &seed)
 {
-    const std::string sanitized = sanitize_id_fragment(seed);
-    if (!sanitized.empty() && sanitized.size() <= 64)
+    std::string sanitized;
+    if (sanitized_fits(seed, 64, sanitized))
         return prefix + "_" + sanitized;
     return prefix + "_" + short_stable_hash(seed);
 }
