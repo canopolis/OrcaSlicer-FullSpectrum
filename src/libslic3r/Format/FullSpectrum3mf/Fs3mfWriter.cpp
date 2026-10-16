@@ -13,10 +13,6 @@
 #include <algorithm>
 #include <iomanip>
 #include <cstdint>
-#include <algorithm>
-#include <chrono>
-#include <set>
-#include <boost/log/trivial.hpp>
 #include <memory>
 #include <mutex>
 #include <openssl/sha.h>
@@ -362,70 +358,14 @@ std::string xml_escape(const std::string &text)
 // periodic project backup runs this on the GUI thread. Cache the result
 // keyed by the immutable VolumeData pointers so unchanged data is reused.
 namespace {
-// Image-map bindings never reference anything outside their own volume
-// (zones, texture assets), so they can be validated once when the cache is
-// built. Same checks as validate_package_model(); duplicates found by sorting.
-bool image_map_bindings_valid(const ImageMaps &maps)
-{
-    std::set<std::string> asset_refs;
-    for (const ImageMapTextureAsset &asset : maps.texture_assets)
-        asset_refs.insert(asset.id);
-    for (const ImageMapVolume &volume : maps.volumes) {
-        std::vector<uint64_t> keys;
-        keys.reserve(volume.triangle_bindings.size());
-        for (const ImageMapTriangleBinding &binding : volume.triangle_bindings) {
-            if (binding.zone_index >= volume.zones.size())
-                return false;
-            if (binding.source.kind != "texture" && binding.source.kind != "vertex_colors" && binding.source.kind != "face_color")
-                return false;
-            if (binding.source.kind == "texture" && asset_refs.count(binding.source.texture_asset_ref) == 0)
-                return false;
-            if (binding.source.uvs.size() != 6 || binding.source.corner_rgba.size() != 12)
-                return false;
-            keys.push_back((uint64_t(binding.triangle_index) << 32) | uint64_t(binding.zone_index));
-        }
-        std::sort(keys.begin(), keys.end());
-        if (std::adjacent_find(keys.begin(), keys.end()) != keys.end())
-            return false;
-    }
-    return true;
-}
-
-// Copy of the image maps without the per-triangle bindings (cheap to copy).
-ImageMaps image_maps_without_bindings(const ImageMaps &maps)
-{
-    ImageMaps light;
-    light.kind           = maps.kind;
-    light.schema_version = maps.schema_version;
-    light.texture_assets = maps.texture_assets;
-    light.volumes.reserve(maps.volumes.size());
-    for (const ImageMapVolume &volume : maps.volumes) {
-        ImageMapVolume v;
-        v.stable_volume_id     = volume.stable_volume_id;
-        v.topology_fingerprint = volume.topology_fingerprint;
-        v.zones                = volume.zones;
-        light.volumes.emplace_back(std::move(v));
-    }
-    return light;
-}
-
-long long elapsed_ms(std::chrono::steady_clock::time_point since)
-{
-    return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
-}
-
 struct ImageMapsCache
 {
-    std::string                                            key;
+    std::string                                          key;
     std::vector<std::weak_ptr<const ImageMap::VolumeData>> sources;
-    // Full maps are kept only if their bindings failed validation, so that
-    // validate_package_model() reports the error as before. Otherwise only
-    // the binding-free copy is kept (the bindings live in `json`).
-    std::optional<ImageMaps>                               image_maps;
-    bool                                                   bindings_stripped = false;
-    std::vector<ImageMapAssetPart>                         assets;
-    std::string                                            json;
-    std::string                                            json_sha256;
+    std::optional<ImageMaps>                             image_maps;
+    std::vector<ImageMapAssetPart>                       assets;
+    std::string                                          json;
+    std::string                                          json_sha256;
 };
 
 std::mutex     s_image_maps_cache_mutex;
@@ -458,39 +398,19 @@ void build_image_maps_cached(const GeometryBindingInput &geometry, const std::st
         hit = s_image_maps_cache.sources[i].lock() == sources[i];
     if (!hit) {
         ImageMapsCache fresh;
-        auto           t = std::chrono::steady_clock::now();
-        std::optional<ImageMaps> full = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, fresh.assets);
-        BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: convert image maps " << elapsed_ms(t) << " ms";
-        if (full) {
-            t          = std::chrono::steady_clock::now();
-            fresh.json = serialize_image_maps_fast(*full);
-            BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: image-maps json " << elapsed_ms(t) << " ms";
-            t                 = std::chrono::steady_clock::now();
+        fresh.image_maps = image_maps_from_geometry(geometry, model.materials, model.mixed_filaments, fresh.assets);
+        if (fresh.image_maps) {
+            fresh.json        = serialize_image_maps_fast(*fresh.image_maps);
             fresh.json_sha256 = sha256_hex(fresh.json);
-            BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: image-maps sha256 " << elapsed_ms(t) << " ms";
-            t                  = std::chrono::steady_clock::now();
-            const bool valid   = image_map_bindings_valid(*full);
-            BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: validate bindings " << elapsed_ms(t) << " ms, valid " << valid;
-            if (valid) {
-                fresh.image_maps        = image_maps_without_bindings(*full);
-                fresh.bindings_stripped = true;
-            } else {
-                fresh.image_maps = std::move(full);
-            }
         }
-        t = std::chrono::steady_clock::now();
-        full.reset(); // release the per-triangle copy now
-        BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: release full maps " << elapsed_ms(t) << " ms";
         fresh.key = std::move(key);
         for (const auto &source : sources)
             fresh.sources.emplace_back(source);
         s_image_maps_cache = std::move(fresh);
-    } else {
-        BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: image maps reused from cache";
     }
-    model.image_maps        = s_image_maps_cache.image_maps;
-    model.image_map_assets  = s_image_maps_cache.assets;
-    model.image_maps_json   = s_image_maps_cache.json;
+    model.image_maps       = s_image_maps_cache.image_maps;
+    model.image_map_assets = s_image_maps_cache.assets;
+    model.image_maps_json  = s_image_maps_cache.json;
     model.image_maps_sha256 = s_image_maps_cache.json_sha256;
 }
 } // namespace
@@ -675,9 +595,7 @@ PackageModel build_package_model(const DynamicPrintConfig &config,
 
 PackageWritePlan build_write_plan(const PackageModel &model)
 {
-    const auto       validate_t0 = std::chrono::steady_clock::now();
-    ValidationResult validation  = validate_package_model(model);
-    BOOST_LOG_TRIVIAL(info) << "FullSpectrum save timing: validate package " << elapsed_ms(validate_t0) << " ms";
+    ValidationResult validation = validate_package_model(model);
     if (!validation.valid) {
         std::ostringstream ss;
         ss << "Invalid FullSpectrum 3MF package model:";
