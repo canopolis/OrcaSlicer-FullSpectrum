@@ -6390,6 +6390,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         geometry.preserved_parts = m_fullspectrum_preserved_parts;
 
         std::set<std::string> seen_objects;
+        std::set<std::string> seen_volume_ids;
         for (const ObjectToObjectDataMap::value_type& obj_metadata : objects_data) {
             const ModelObject *obj = obj_metadata.second.object;
             if (obj == nullptr)
@@ -6414,6 +6415,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 input.stable_object_id = stable_object_id;
                 input.stable_volume_id =
                     FullSpectrum3mf::stable_volume_id_from_model(model, *volume, volume_id_it->second);
+                // Stable volume ids must be unique in the package (e.g. a copy can
+                // inherit an id already used). Keep the first, make later ones unique.
+                if (!seen_volume_ids.insert(input.stable_volume_id).second) {
+                    const std::string base = input.stable_volume_id;
+                    for (int n = 2; !seen_volume_ids.insert(input.stable_volume_id).second; ++n)
+                        input.stable_volume_id = base + "_" + std::to_string(n);
+                }
                 input.extruder_id = volume->extruder_id();
                 for (size_t extruder_idx : volume->get_extruders_from_multi_material_painting())
                 input.paint_states.push_back(int(extruder_idx + 1));
@@ -6835,7 +6843,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         if (volume == nullptr)
                             continue;
                         volume_count++;
-                        if (m_share_mesh) {
+                        // FullSpectrum: a volume with an image map must be written with its
+                        // own 3MF id. Sharing the mesh gives copies id 0, so several copies
+                        // end up with the same stable volume id ("vol_0"), the FullSpectrum
+                        // package fails validation and the colors are not saved.
+                        const bool has_image_map = volume->image_map_data() && !volume->image_map_data()->empty();
+                        if (m_share_mesh && !has_image_map) {
                             auto iter = m_shared_meshes.find(volume->mesh_ptr().get());
                             if (iter != m_shared_meshes.end())
                             {
