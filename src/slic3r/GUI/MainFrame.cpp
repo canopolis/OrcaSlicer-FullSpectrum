@@ -4251,8 +4251,8 @@ void MainFrame::delete_logs()
 
 void MainFrame::export_logs()
 {
-    // 1. Get log folder path
-    auto log_folder = boost::filesystem::path(data_dir()) / "log";
+    // 1. Get log folder path (same folder where the logs are written)
+    auto log_folder = runtime_log_folder();
 
     // 2. Check if log folder exists
     if (!boost::filesystem::exists(log_folder) || boost::filesystem::is_empty(log_folder)) {

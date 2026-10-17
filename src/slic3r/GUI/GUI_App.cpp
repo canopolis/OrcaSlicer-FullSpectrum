@@ -30,6 +30,7 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cctype>
 #include <iterator>
@@ -45,6 +46,7 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/convert.hpp>
+#include <boost/nowide/cstdlib.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/beast/core/detail/base64.hpp>
@@ -2187,6 +2189,58 @@ void GUI_App::init_webview_runtime()
         }
     }
 }
+
+// FullSpectrum Plus: delete old session logs at startup, keeping the most
+// recent ones. Only files named like "YYYY-MM-DD-HH-MM-SS..." containing
+// "log" are touched; they sort by name in chronological order. Any error is
+// ignored (a file in use is simply left in place).
+static void cleanup_old_session_logs(size_t keep)
+{
+    namespace fs = boost::filesystem;
+    try {
+        fs::path folder = fs::path(data_dir()) / "log";
+#ifdef _WIN32
+        if (const char *local_appdata = boost::nowide::getenv("LOCALAPPDATA"); local_appdata != nullptr && *local_appdata != '\0')
+            folder = fs::path(local_appdata) / "Snapmaker_Orca" / "log";
+#endif
+        boost::system::error_code ec;
+        if (!fs::is_directory(folder, ec))
+            return;
+
+        auto is_session_log = [](const std::string &name) {
+            static const char pattern[] = "dddd-dd-dd-dd-dd-dd";
+            if (name.size() < sizeof(pattern) - 1 || name.find("log") == std::string::npos)
+                return false;
+            for (size_t i = 0; i + 1 < sizeof(pattern); ++i) {
+                const bool digit = name[i] >= '0' && name[i] <= '9';
+                if (pattern[i] == 'd' ? !digit : name[i] != '-')
+                    return false;
+            }
+            return true;
+        };
+
+        std::vector<std::string> names;
+        for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            if (!fs::is_regular_file(it->path(), ec))
+                continue;
+            const std::string name = it->path().filename().string();
+            if (is_session_log(name))
+                names.push_back(name);
+        }
+        if (names.size() <= keep)
+            return;
+        std::sort(names.begin(), names.end(), std::greater<std::string>());
+        int removed = 0;
+        for (size_t i = keep; i < names.size(); ++i) {
+            boost::system::error_code rm_ec;
+            if (fs::remove(folder / names[i], rm_ec) && !rm_ec)
+                ++removed;
+        }
+        BOOST_LOG_TRIVIAL(info) << "Log cleanup: kept " << keep << " most recent session logs, removed " << removed;
+    } catch (...) {
+        // never block startup because of log cleanup
+    }
+}
 #endif
 
 void GUI_App::init_app_config()
@@ -2257,6 +2311,8 @@ void GUI_App::init_app_config()
 #else
     set_log_path_and_level(log_filename, 3);
 #endif
+    // Keep only the 2 most recent session logs (current + previous session).
+    cleanup_old_session_logs(2);
 
     //BBS: remove GCodeViewer as seperate APP logic
 	if (!app_config)
