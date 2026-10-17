@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <chrono>
 #include <cctype>
 #include <iterator>
@@ -2190,13 +2191,17 @@ void GUI_App::init_webview_runtime()
     }
 }
 
-// FullSpectrum Plus: delete old session logs at startup, keeping the most
-// recent ones. Only files named like "YYYY-MM-DD-HH-MM-SS..." containing
-// "log" are touched; they sort by name in chronological order. Any error is
-// ignored (a file in use is simply left in place).
-static void cleanup_old_session_logs(size_t keep)
+// FullSpectrum Plus: delete old session logs at startup. Keeps the current
+// session's log (it may not exist on disk yet when this runs) plus the
+// `keep_previous` most recent earlier sessions; everything else is deleted.
+// Only files named like "YYYY-MM-DD-HH-MM-SS..." containing "log" are
+// touched; the 19-character timestamp identifies the session (rotated files
+// .log.0, .log.1 ... of one session are kept or deleted together). Any error
+// is ignored (a file in use is simply left in place).
+static void cleanup_old_session_logs(const std::string &current_log_filename, size_t keep_previous)
 {
     namespace fs = boost::filesystem;
+    static const size_t TS_LEN = 19; // "YYYY-MM-DD-HH-MM-SS"
     try {
         fs::path folder = fs::path(data_dir()) / "log";
 #ifdef _WIN32
@@ -2209,9 +2214,9 @@ static void cleanup_old_session_logs(size_t keep)
 
         auto is_session_log = [](const std::string &name) {
             static const char pattern[] = "dddd-dd-dd-dd-dd-dd";
-            if (name.size() < sizeof(pattern) - 1 || name.find("log") == std::string::npos)
+            if (name.size() < TS_LEN || name.find("log") == std::string::npos)
                 return false;
-            for (size_t i = 0; i + 1 < sizeof(pattern); ++i) {
+            for (size_t i = 0; i < TS_LEN; ++i) {
                 const bool digit = name[i] >= '0' && name[i] <= '9';
                 if (pattern[i] == 'd' ? !digit : name[i] != '-')
                     return false;
@@ -2219,24 +2224,38 @@ static void cleanup_old_session_logs(size_t keep)
             return true;
         };
 
+        const std::string current_session = current_log_filename.substr(0, TS_LEN);
+
         std::vector<std::string> names;
+        std::set<std::string>    previous_sessions;
         for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
             if (!fs::is_regular_file(it->path(), ec))
                 continue;
             const std::string name = it->path().filename().string();
-            if (is_session_log(name))
-                names.push_back(name);
+            if (!is_session_log(name))
+                continue;
+            names.push_back(name);
+            const std::string session = name.substr(0, TS_LEN);
+            if (session != current_session)
+                previous_sessions.insert(session);
         }
-        if (names.size() <= keep)
-            return;
-        std::sort(names.begin(), names.end(), std::greater<std::string>());
+
+        // Sessions to keep: the current one + the newest `keep_previous` others.
+        std::set<std::string> keep_sessions{current_session};
+        size_t                kept = 0;
+        for (auto it = previous_sessions.rbegin(); it != previous_sessions.rend() && kept < keep_previous; ++it, ++kept)
+            keep_sessions.insert(*it);
+
         int removed = 0;
-        for (size_t i = keep; i < names.size(); ++i) {
+        for (const std::string &name : names) {
+            if (keep_sessions.count(name.substr(0, TS_LEN)))
+                continue;
             boost::system::error_code rm_ec;
-            if (fs::remove(folder / names[i], rm_ec) && !rm_ec)
+            if (fs::remove(folder / name, rm_ec) && !rm_ec)
                 ++removed;
         }
-        BOOST_LOG_TRIVIAL(info) << "Log cleanup: kept " << keep << " most recent session logs, removed " << removed;
+        if (removed > 0)
+            BOOST_LOG_TRIVIAL(info) << "Log cleanup: kept current + " << kept << " previous session log(s), removed " << removed << " file(s)";
     } catch (...) {
         // never block startup because of log cleanup
     }
@@ -2311,8 +2330,8 @@ void GUI_App::init_app_config()
 #else
     set_log_path_and_level(log_filename, 3);
 #endif
-    // Keep only the 2 most recent session logs (current + previous session).
-    cleanup_old_session_logs(2);
+    // Keep only the current session log + the previous session's log.
+    cleanup_old_session_logs(log_filename, 1);
 
     //BBS: remove GCodeViewer as seperate APP logic
 	if (!app_config)
